@@ -1,0 +1,1 @@
+COPY "amzn-s3-data-engg-project-table" FROM '{manifest_path}' IAM_ROLE 'arn:aws:iam::467416171660:role/service-role/AmazonRedshift-CommandsAccessRole-20260703T172218' FORMAT AS CSV MANIFEST IGNOREHEADER 1;
