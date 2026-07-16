@@ -1,0 +1,243 @@
+Comment: A description of my state machine
+StartAt: data-engg-project-lambda-dq-check
+States:
+  data-engg-project-lambda-dq-check:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    OutputPath: $.Payload
+    Parameters:
+      Payload.$: $
+      FunctionName: >-
+        arn:aws:lambda:us-east-1:467416171660:function:amzn-lambda-data_engg_project-dq_check:$LATEST
+    Retry:
+      - ErrorEquals:
+          - Lambda.ServiceException
+          - Lambda.AWSLambdaException
+          - Lambda.SdkClientException
+          - Lambda.TooManyRequestsException
+        IntervalSeconds: 1
+        MaxAttempts: 3
+        BackoffRate: 2
+        JitterStrategy: FULL
+    Next: data-engg-project-ChoiceLoadType
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+  data-engg-project-ChoiceLoadType:
+    Type: Choice
+    Choices:
+      - Next: data-engg-project-glue-transformation-historical
+        Variable: $.load_type
+        StringMatches: historical_data
+      - Next: data-engg-project-glue-transformation-incremental
+        Variable: $.load_type
+        StringMatches: incremental_data
+  data-engg-project-glue-transformation-historical:
+    Type: Task
+    Resource: arn:aws:states:::glue:startJobRun.sync
+    Parameters:
+      JobName: glue-data-engg-project-notebook
+      Arguments:
+        '--data_flow_type': historical_data
+    Next: data-engg-project-lambda-return-latest-manifest
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+  data-engg-project-lambda-return-latest-manifest:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    OutputPath: $.Payload
+    Parameters:
+      Payload.$: $
+      FunctionName: >-
+        arn:aws:lambda:us-east-1:467416171660:function:amzn-lambda-data_engg_project-latest-manifest:$LATEST
+    Retry:
+      - ErrorEquals:
+          - Lambda.ServiceException
+          - Lambda.AWSLambdaException
+          - Lambda.SdkClientException
+          - Lambda.TooManyRequestsException
+        IntervalSeconds: 1
+        MaxAttempts: 3
+        BackoffRate: 2
+        JitterStrategy: FULL
+    Next: data-engg-project-ExecuteStatementLoadData
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+  data-engg-project-SNS-common:
+    Type: Task
+    Resource: arn:aws:states:::sns:publish
+    Parameters:
+      Message.$: $
+      TopicArn: arn:aws:sns:us-east-1:467416171660:data-engg-project-SNS-topic
+    End: true
+  data-engg-project-ExecuteStatementLoadData:
+    Type: Task
+    Parameters:
+      WorkgroupName: amzn-s3-data-engg-project-wg
+      Database: dev
+      Sql.$: >-
+        States.Format('COPY "amzn-s3-data-engg-project-table" FROM \'{}\'
+        IAM_ROLE
+        \'arn:aws:iam::467416171660:role/service-role/AmazonRedshift-CommandsAccessRole-20260703T172218\'
+        FORMAT AS CSV MANIFEST IGNOREHEADER 1;', $.manifest_path)
+    Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+    Next: data-engg-project-WaitForLoad
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+  data-engg-project-WaitForLoad:
+    Type: Wait
+    Seconds: 5
+    Next: data-engg-project-DescribeStatementLoadData
+  data-engg-project-DescribeStatementLoadData:
+    Type: Task
+    Parameters:
+      Id.$: $.Id
+    Resource: arn:aws:states:::aws-sdk:redshiftdata:describeStatement
+    Next: data-engg-project-ChoiceForLoad
+  data-engg-project-ChoiceForLoad:
+    Type: Choice
+    Choices:
+      - Next: data-engg-project-ExecuteStatementGetData
+        Variable: $.Status
+        StringMatches: FINISHED
+      - Next: data-engg-project-SNS-LoadStatementFailed
+        Variable: $.Status
+        StringMatches: FAILED
+      - Next: data-engg-project-SNS-LoadStatementAbort
+        Variable: $.Status
+        StringMatches: ABORTED
+    Default: data-engg-project-WaitForLoad
+  data-engg-project-SNS-LoadStatementAbort:
+    Type: Task
+    Resource: arn:aws:states:::sns:publish
+    Parameters:
+      TopicArn: arn:aws:sns:us-east-1:467416171660:data-engg-project-SNS-topic
+      Message:
+        message: ExecuteStatementLoadDataAborted
+    End: true
+  data-engg-project-SNS-LoadStatementFailed:
+    Type: Task
+    Resource: arn:aws:states:::sns:publish
+    Parameters:
+      TopicArn: arn:aws:sns:us-east-1:467416171660:data-engg-project-SNS-topic
+      Message:
+        message: ExecuteStatementLoadDataFailed
+    End: true
+  data-engg-project-ExecuteStatementGetData:
+    Type: Task
+    Parameters:
+      WorkgroupName: amzn-s3-data-engg-project-wg
+      Database: dev
+      Sql: >-
+        SELECT match_id, date FROM "amzn-s3-data-engg-project-table" ORDER BY
+        match_id LIMIT 5;
+    Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+    Next: data-engg-project-WaitForGet
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+  data-engg-project-WaitForGet:
+    Type: Wait
+    Seconds: 5
+    Next: data-engg-project-DescribeStatementGetData
+  data-engg-project-DescribeStatementGetData:
+    Type: Task
+    Parameters:
+      Id.$: $.Id
+    Resource: arn:aws:states:::aws-sdk:redshiftdata:describeStatement
+    Next: data-engg-project-ChoiceForGet
+  data-engg-project-ChoiceForGet:
+    Type: Choice
+    Choices:
+      - Next: data-engg-project-GetStatementResultGetData
+        Variable: $.Status
+        StringMatches: FINISHED
+      - Next: data-engg-project-SNS-GetStatementAborted
+        Variable: $.Status
+        StringMatches: ABORTED
+      - Next: data-engg-project-SNS-GetStatementFailed
+        Variable: $.Status
+        StringMatches: FAILED
+    Default: data-engg-project-WaitForGet
+  data-engg-project-SNS-GetStatementFailed:
+    Type: Task
+    Resource: arn:aws:states:::sns:publish
+    Parameters:
+      TopicArn: arn:aws:sns:us-east-1:467416171660:data-engg-project-SNS-topic
+      Message:
+        message: ExecuteStatementGetDataFailed
+    End: true
+  data-engg-project-SNS-GetStatementAborted:
+    Type: Task
+    Resource: arn:aws:states:::sns:publish
+    Parameters:
+      TopicArn: arn:aws:sns:us-east-1:467416171660:data-engg-project-SNS-topic
+      Message:
+        message: ExecuteStatementGetDataAborted
+    End: true
+  data-engg-project-GetStatementResultGetData:
+    Type: Task
+    Parameters:
+      Id.$: $.Id
+    Resource: arn:aws:states:::aws-sdk:redshiftdata:getStatementResult
+    Next: data-engg-project-lambda-result-formatting
+  data-engg-project-lambda-result-formatting:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    OutputPath: $.Payload
+    Parameters:
+      Payload.$: $
+      FunctionName: >-
+        arn:aws:lambda:us-east-1:467416171660:function:amzn-lambda-data_engg_project-result-formatting:$LATEST
+    Retry:
+      - ErrorEquals:
+          - Lambda.ServiceException
+          - Lambda.AWSLambdaException
+          - Lambda.SdkClientException
+          - Lambda.TooManyRequestsException
+        IntervalSeconds: 1
+        MaxAttempts: 3
+        BackoffRate: 2
+        JitterStrategy: FULL
+    Next: data-engg-project-SendEmailReport
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+  data-engg-project-SendEmailReport:
+    Type: Task
+    Parameters:
+      FromEmailAddress: akasharavinth26@gmail.com
+      Destination:
+        ToAddresses:
+          - akasharavinth26@gmail.com
+      Content:
+        Simple:
+          Subject:
+            Data: Data Engineering Project Report
+          Body:
+            Html:
+              Data.$: $.htmlBody
+    Resource: arn:aws:states:::aws-sdk:sesv2:sendEmail
+    End: true
+  data-engg-project-glue-transformation-incremental:
+    Type: Task
+    Resource: arn:aws:states:::glue:startJobRun.sync
+    Parameters:
+      JobName: glue-data-engg-project-notebook
+      Arguments:
+        '--data_flow_type': incremental_data
+    Next: data-engg-project-lambda-return-latest-manifest
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        Next: data-engg-project-SNS-common
+QueryLanguage: JSONPath
